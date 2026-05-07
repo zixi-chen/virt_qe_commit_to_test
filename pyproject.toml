@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "virt-qe-agent"
+version = "0.1.0"
+description = "Virt QE automated patch analysis agent"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "openai",
+  "python-dotenv",
+  "tqdm",
+  "jsonlines",
+]
+
+[project.scripts]
+virt-qe-agent = "qe_agent.cli:main"

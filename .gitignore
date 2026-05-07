@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+.DS_Store
+
+# Local env and editor
+.env
+
+# Generated reports / local artifacts
+test_plan_report.md
+test_plan_report.csv
+report_*.md
+*.patch
+
+# Local cloned upstream test repo (do not vendor into this repo)
+tp-qemu/
+tp-qemu

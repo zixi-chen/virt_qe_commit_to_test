@@ -1,0 +1,64 @@
+{
+  "path_subsystem_map": [
+    ["arch/x86/kvm", "KVM"],
+    ["arch/x86/include/asm/kvm", "KVM"],
+    ["virt/kvm", "KVM"],
+    ["include/linux/kvm", "KVM"],
+    ["drivers/net", "Network"],
+    ["net/", "Network"],
+    ["drivers/scsi", "Storage"],
+    ["drivers/nvme", "Storage"],
+    ["block/", "Storage"],
+    ["fs/", "Filesystem"]
+  ],
+  "kvm_banned_test_keywords": [
+    "net",
+    "storage",
+    "virtio-fs",
+    "virtio_fs",
+    "block"
+  ],
+  "arch_x86_kvm_test_allow_keywords": [
+    "kvm",
+    "boot",
+    "smp",
+    "interrupt",
+    "cpu"
+  ],
+  "hard_domain_mapping": {
+    "tdx": {
+      "path_contains": ["kvm/tdx", "vmx/tdx"],
+      "subject_keywords": ["tdx"],
+      "test_keywords": ["tdx"],
+      "explicit_call_patterns": ["is_tdx_vm\\(", "tdx_"]
+    },
+    "sev_snp": {
+      "path_contains": ["svm/sev", "svm/snp"],
+      "subject_keywords": ["sev", "snp"],
+      "test_keywords": ["sev", "snp"],
+      "explicit_call_patterns": ["is_sev", "is_snp", "sev_", "snp_"]
+    },
+    "core_kvm": {
+      "path_prefix": "arch/x86/kvm/",
+      "core_files": ["x86.c", "mmu.c", "lapic.c"],
+      "allowed_tests": ["boot", "kvm_unit_test", "smp"]
+    }
+  },
+  "optional_tool_tests_for_refactor": [
+    "qemu/tests/kvm_stat.py",
+    "qemu/tests/hv_kvm_unit_test.py"
+  ],
+  "forced_domain_tests": {
+    "tdx": [
+      "qemu/tests/tdx_multi_vms.py",
+      "qemu/tests/tdx_pccs.py"
+    ]
+  },
+  "refactor_subject_keywords": [
+    "plumb",
+    "refactor",
+    "rename",
+    "cleanup",
+    "mechanical"
+  ]
+}
