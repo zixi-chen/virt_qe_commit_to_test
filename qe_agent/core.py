@@ -105,8 +105,13 @@ def load_runtime_env(project_root: Path) -> None:
     except Exception:
         return
     load_dotenv(project_root / ".env", override=True)
-    if not get_env_var("DEEPSEEK_API_KEY"):
+    if not os.getenv("DEEPSEEK_API_KEY", "").strip():
         load_dotenv(project_root / ".env.example", override=False)
+
+
+def read_text(path: Path) -> str:
+    """Read text from file with optional size limit."""
+    return path.read_text(encoding="utf-8", errors="ignore")
 
 
 def normalize_tokens(value: str) -> List[str]:
@@ -426,7 +431,7 @@ def infer_subsystem(changed_files: List[str]) -> str:
     return first.split("/", 1)[0] if "/" in first else "misc"
 
 
-def cluster_commits(commits: List[CommitRecord]) -> List[Tuple[str, CommitRecord, List[str]]]:
+def cluster_commits(commits: List[CommitRecord], config: AnalysisConfig) -> List[Tuple[str, CommitRecord, List[str]]]:
     grouped: Dict[str, List[CommitRecord]] = defaultdict(list)
     for commit in commits:
         grouped[infer_subsystem(commit.changed_files)].append(commit)
@@ -434,7 +439,7 @@ def cluster_commits(commits: List[CommitRecord]) -> List[Tuple[str, CommitRecord
     for subsystem, items in list(grouped.items()):
         retained = []
         for commit in items:
-            if is_tdx_related_commit(commit):
+            if is_tdx_related_commit(commit, config):
                 tdx_commits.append(commit)
             else:
                 retained.append(commit)
@@ -475,7 +480,7 @@ def needs_dual_path_validation(commit: CommitRecord, config: AnalysisConfig) -> 
 
 def apply_dual_path_validation(commit: CommitRecord, tests: List[str], config: AnalysisConfig) -> Tuple[List[str], List[str]]:
     notes: List[str] = []
-    if not needs_dual_path_validation(commit):
+    if not needs_dual_path_validation(commit, config):
         return tests, notes
 
     mapping_index = config.get_mapping()
