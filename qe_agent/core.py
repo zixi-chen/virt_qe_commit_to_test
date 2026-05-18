@@ -34,6 +34,17 @@ MAX_DIFF_CONTEXT_CHARS = 60000
 MAX_DIFF_FILES = 6
 MAX_HUNKS_PER_FILE = 2
 MAX_HUNK_LINES = 80
+DIFF_KEYWORDS = ("kvm", "tdx", "sev", "snp", "memslot", "readonly", "ioctl", "qmp")
+
+
+class HunkDetail(NamedTuple):
+    score: int
+    clipped: str
+    header: str
+    added_lines: int
+    removed_lines: int
+    keywords: Tuple[str, ...]
+    semantic: str
 
 
 # Data class for configuration to avoid global state
@@ -640,8 +651,6 @@ def _split_diff_by_file(diff_text: str) -> List[Tuple[str, str]]:
 def _score_hunk_lines(hunk_lines: List[str]) -> int:
     changed = 0
     keyword_bonus = 0
-    # Pre-compute keyword set for faster lookup
-    keywords = {"kvm", "tdx", "sev", "snp", "memslot", "readonly", "ioctl", "qmp"}
 
     # Check each line for changes and keywords
     for line in hunk_lines:
@@ -652,20 +661,55 @@ def _score_hunk_lines(hunk_lines: List[str]) -> int:
 
         # Check for keywords in the line (more efficient than joining all)
         line_lower = line.lower()
-        keyword_bonus += sum(1 for keyword in keywords if keyword in line_lower)
+        keyword_bonus += sum(1 for keyword in DIFF_KEYWORDS if keyword in line_lower)
 
     return changed + keyword_bonus
 
 
-def _extract_hunks_for_file(file_block: str) -> List[Tuple[int, str]]:
+def _semantic_label_from_hunk(header: str, changed_lines: List[str]) -> str:
+    joined = "\n".join(changed_lines).lower()
+    if any(token in joined for token in ("if (", "else", "switch (", "case ")):
+        return "conditional-path update"
+    if any(token in joined for token in ("return -", "goto ", "warn", "error", "fail")):
+        return "error-path update"
+    if any(token in joined for token in ("struct ", "enum ", "typedef ")):
+        return "data-structure update"
+    if any(token in joined for token in ("is_tdx", "sev", "snp", "readonly", "memslot")):
+        return "guest-mode behavior update"
+    if any(token in joined for token in ("ioctl", "qmp", "kvm_", "vmx", "svm")):
+        return "control-path interface update"
+    if "(" in header and ")" in header:
+        return "function-logic update"
+    return "behavioral code update"
+
+
+def _extract_hunk_details_for_file(file_block: str) -> List[HunkDetail]:
     hunk_markers = list(re.finditer(r"^@@ .* @@.*$", file_block, flags=re.M))
     if not hunk_markers:
         lines = file_block.splitlines()
         preview = "\n".join(lines[:MAX_HUNK_LINES])
-        return [(_score_hunk_lines(lines[:MAX_HUNK_LINES]), preview)] if preview else []
+        if not preview:
+            return []
+        changed_lines = [
+            line for line in lines
+            if (line.startswith("+") or line.startswith("-")) and not (line.startswith("+++") or line.startswith("---"))
+        ]
+        added_lines = sum(1 for line in changed_lines if line.startswith("+"))
+        removed_lines = sum(1 for line in changed_lines if line.startswith("-"))
+        hit_keywords = tuple(sorted({kw for kw in DIFF_KEYWORDS if any(kw in line.lower() for line in changed_lines)}))
+        return [
+            HunkDetail(
+                score=_score_hunk_lines(lines[:MAX_HUNK_LINES]),
+                clipped=preview,
+                header="(synthetic-preview)",
+                added_lines=added_lines,
+                removed_lines=removed_lines,
+                keywords=hit_keywords,
+                semantic=_semantic_label_from_hunk("(synthetic-preview)", changed_lines),
+            )
+        ]
 
-    ranked: List[Tuple[int, str]] = []
-    # Process hunks without loading entire block in memory
+    details: List[HunkDetail] = []
     for idx, marker in enumerate(hunk_markers):
         start = marker.start()
         end = hunk_markers[idx + 1].start() if idx + 1 < len(hunk_markers) else len(file_block)
@@ -674,20 +718,36 @@ def _extract_hunks_for_file(file_block: str) -> List[Tuple[int, str]]:
         hunk_text = file_block[start:end]
         hunk_lines = hunk_text.splitlines()
 
-        # Score and truncate if needed
+        header = hunk_lines[0].strip() if hunk_lines else "@@ unknown @@"
+        changed_lines = [
+            line for line in hunk_lines
+            if (line.startswith("+") or line.startswith("-")) and not (line.startswith("+++") or line.startswith("---"))
+        ]
+        added_lines = sum(1 for line in changed_lines if line.startswith("+"))
+        removed_lines = sum(1 for line in changed_lines if line.startswith("-"))
+        hit_keywords = tuple(sorted({kw for kw in DIFF_KEYWORDS if any(kw in line.lower() for line in changed_lines)}))
         score = _score_hunk_lines(hunk_lines)
         clipped = "\n".join(hunk_lines[:MAX_HUNK_LINES])
         if len(hunk_lines) > MAX_HUNK_LINES:
             clipped += "\n... (hunk truncated)"
+        details.append(
+            HunkDetail(
+                score=score,
+                clipped=clipped,
+                header=header,
+                added_lines=added_lines,
+                removed_lines=removed_lines,
+                keywords=hit_keywords,
+                semantic=_semantic_label_from_hunk(header, changed_lines),
+            )
+        )
+    return details
 
-        ranked.append((score, clipped))
 
-        # Early exit if we have enough hunks
-        if len(ranked) >= MAX_HUNKS_PER_FILE:
-            break
-
-    ranked.sort(key=lambda item: item[0], reverse=True)
-    return ranked[:MAX_HUNKS_PER_FILE]
+def _extract_hunks_for_file(file_block: str) -> List[Tuple[int, str]]:
+    details = _extract_hunk_details_for_file(file_block)
+    ranked = sorted(details, key=lambda item: item.score, reverse=True)[:MAX_HUNKS_PER_FILE]
+    return [(item.score, item.clipped) for item in ranked]
 
 
 def build_diff_hunk_context(commit: CommitRecord) -> str:
@@ -695,24 +755,90 @@ def build_diff_hunk_context(commit: CommitRecord) -> str:
     if not file_blocks:
         return "No structured diff hunks found."
     order = {path: idx for idx, path in enumerate(commit.changed_files)}
-    ranked_files: List[Tuple[int, int, str, List[Tuple[int, str]]]] = []
+    ranked_files: List[Tuple[int, int, str, List[HunkDetail], List[Tuple[int, HunkDetail]]]] = []
+    total_hunks_detected = 0
     for path, block in file_blocks:
-        hunks = _extract_hunks_for_file(block)
-        if not hunks:
+        details = _extract_hunk_details_for_file(block)
+        if not details:
             continue
-        file_score = sum(score for score, _ in hunks)
-        ranked_files.append((file_score, -order.get(path, 10**6), path, hunks))
+        total_hunks_detected += len(details)
+        ranked = sorted(enumerate(details), key=lambda item: item[1].score, reverse=True)
+        selected_ranked = ranked[:MAX_HUNKS_PER_FILE]
+        selected_hunks = [detail for _, detail in selected_ranked]
+        selected_indices = {idx for idx, _ in selected_ranked}
+        summarized_hunks = [(idx + 1, detail) for idx, detail in enumerate(details) if idx not in selected_indices]
+        file_score = sum(detail.score for detail in selected_hunks)
+        ranked_files.append((file_score, -order.get(path, 10**6), path, selected_hunks, summarized_hunks))
     ranked_files.sort(key=lambda item: (item[0], item[1]), reverse=True)
     selected_files = ranked_files[:MAX_DIFF_FILES]
 
-    sections: List[str] = []
-    total_chars = 0
-    for _, __, path, hunks in selected_files:
-        for index, (score, hunk_text) in enumerate(hunks, start=1):
+    expanded_files = len(selected_files)
+    omitted_files = ranked_files[MAX_DIFF_FILES:]
+    expanded_hunks = sum(len(hunks) for _, __, ___, hunks, ____ in selected_files)
+    summarized_hunks = max(0, total_hunks_detected - expanded_hunks)
+
+    manifest_lines = [
+        "## Diff coverage manifest",
+        f"- Total files in diff: {len(file_blocks)}",
+        f"- Expanded files in prompt: {expanded_files}",
+        f"- Omitted files due to cap ({MAX_DIFF_FILES}): {len(omitted_files)}",
+        f"- Total hunks detected: {total_hunks_detected}",
+        f"- Expanded hunks in prompt: {expanded_hunks}",
+        f"- Hunks summarized-only or omitted: {summarized_hunks}",
+    ]
+
+    selected_summary_lines = []
+    for _, __, path, hunks, file_summaries in selected_files:
+        if file_summaries:
+            selected_summary_lines.append(
+                f"- {path}: expanded {len(hunks)}/{len(hunks) + len(file_summaries)} hunks (top-ranked by risk score)"
+            )
+    if selected_summary_lines:
+        manifest_lines.append("- Selected files with partially expanded hunks:")
+        manifest_lines.extend(selected_summary_lines)
+
+    if omitted_files:
+        manifest_lines.append("- Omitted files (hunks kept out of prompt):")
+        for _, __, path, omitted_selected, file_summaries in omitted_files[:20]:
+            manifest_lines.append(f"- {path} (hunks={len(omitted_selected) + len(file_summaries)})")
+        if len(omitted_files) > 20:
+            manifest_lines.append(f"- ... {len(omitted_files) - 20} more omitted files")
+
+    summary_lines = [
+        "## Structured summaries for non-expanded hunks",
+        "- Format: `<file> | hunk#<n> | semantic=<label> | +/-=<added>/<removed> | keywords=<k1,k2 or none> | header=<@@ ... @@>`",
+    ]
+    for _, __, path, ___, file_summaries in selected_files:
+        for hunk_no, detail in file_summaries:
+            keywords = ",".join(detail.keywords) if detail.keywords else "none"
+            summary_lines.append(
+                f"- `{path}` | hunk#{hunk_no} | semantic={detail.semantic} | +/-={detail.added_lines}/{detail.removed_lines} | "
+                f"keywords={keywords} | header={detail.header}"
+            )
+    for _, __, path, selected_hunks, file_summaries in omitted_files:
+        omitted_details = selected_hunks + [detail for _, detail in file_summaries]
+        for hunk_no, detail in enumerate(omitted_details, start=1):
+            keywords = ",".join(detail.keywords) if detail.keywords else "none"
+            summary_lines.append(
+                f"- `{path}` | hunk#{hunk_no} | semantic={detail.semantic} | +/-={detail.added_lines}/{detail.removed_lines} | "
+                f"keywords={keywords} | header={detail.header}"
+            )
+    if len(summary_lines) == 2:
+        summary_lines.append("- (none)")
+
+    manifest_section = "\n".join(manifest_lines)
+    summary_section = "\n".join(summary_lines)
+    sections: List[str] = [manifest_section, summary_section]
+    total_chars = len(manifest_section) + len(summary_section)
+    if total_chars > MAX_DIFF_CONTEXT_CHARS:
+        sections.append("## Diff context truncated\n\nReached max context size after mandatory manifest + summaries.")
+        return "\n\n".join(sections)
+    for _, __, path, hunks, _ in selected_files:
+        for index, detail in enumerate(hunks, start=1):
             section = (
-                f"## Diff hunk {path} #{index} (score={score})\n"
+                f"## Diff hunk {path} #{index} (score={detail.score})\n"
                 "```diff\n"
-                f"{hunk_text}\n"
+                f"{detail.clipped}\n"
                 "```"
             )
             if total_chars + len(section) > MAX_DIFF_CONTEXT_CHARS:

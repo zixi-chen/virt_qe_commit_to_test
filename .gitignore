@@ -12,6 +12,7 @@ __pycache__/
 test_plan_report.md
 test_plan_report.csv
 report_*.md
+*_report.md
 *.patch
 
 # Local cloned upstream test repo (do not vendor into this repo)
